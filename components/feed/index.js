@@ -6,7 +6,7 @@ import {
   View,
   Dimensions,
   TouchableOpacity,
-  AppState,
+  AppState, // background handling
 } from 'react-native';
 import Post from '../post';
 import Navbar from '../navbar';
@@ -15,6 +15,15 @@ import BottomBar from '../bottomBar';
 import styles from './style';
 
 const { height } = Dimensions.get('window');
+
+// --- Configuration ---
+// This is based on device performance and network conditions
+const SPEED_THRESHOLD_SLOW = 1.0; // Pixels per millisecond
+const SPEED_THRESHOLD_FAST = 3.5; // Pixels per millisecond
+const PRELOAD_WINDOW_SLOW = 2;    // Preload N items before/after when scrolling slow
+const PRELOAD_WINDOW_MEDIUM = 1; // Preload N items before/after when scrolling medium
+const PRELOAD_WINDOW_FAST = 0;   // Preload N items before/after when scrolling fast
+// --------------------
 
 const array = [
   { id: 1, uri: 'https://drive.google.com/uc?export=download&id=1567uKxxJx9J5uvf0BbLU-Qipe0YZZl39' },
@@ -25,6 +34,15 @@ const array = [
   { id: 6, uri: 'https://drive.google.com/uc?export=download&id=1jrZaKS8ZkycMCCW9wdcLQuJTuh4p8WS0' },
   { id: 7, uri: 'https://drive.google.com/uc?export=download&id=1pqHpIZuIR3rCDhdYJkDB6BOYEcwV7ejG' },
 ];
+
+// Helper to create a Map for quick index lookup from item ID
+const createIndexMap = (data) => {
+  const map = new Map();
+  data.forEach((item, index) => {
+    map.set(item.id.toString(), index);
+  });
+  return map;
+};
 
 export default function Feed() {
   const mediaRefs = useRef({});
@@ -54,14 +72,76 @@ export default function Feed() {
   //   };
   // }, []);
 
+  // State for the item index map derived from the data array
+  const [itemIndexMap, setItemIndexMap] = useState(() => createIndexMap(array));
+  useEffect(() => {
+    setItemIndexMap(createIndexMap(array));
+  }, [array]); // Update map if data array instance changes
+
+  // --- Scroll Speed Tracking ---
+  const scrollPos = useRef(0);
+  const lastScrollTime = useRef(Date.now());
+  const scrollSpeed = useRef(0); // Stores the calculated scroll speed
+
+  const onScroll = (event) => {
+    const currentPos = event.nativeEvent.contentOffset.y;
+    const currentTime = Date.now();
+    const deltaT = currentTime - lastScrollTime.current;
+
+    // Calculate speed only if enough time passed to avoid jitter/division by zero
+    if (deltaT > 50) {
+      const instantaneousSpeed = Math.abs((currentPos - scrollPos.current) / deltaT);
+      // Use a simple smoothing (Exponential Moving Average)
+      scrollSpeed.current = (scrollSpeed.current * 0.7) + (instantaneousSpeed * 0.3);
+
+      lastScrollTime.current = currentTime;
+      scrollPos.current = currentPos;
+    }
+  };
+  // ---
+
   const onFactsPress = () => {
     console.log('Facts button clicked!');
   };
 
-  const handleViewableItemsChanged = useRef(({ viewableItems, changed }) => {
+   // --- App State Handling (Pause on Background) ---
+   useEffect(() => {
+    const handleAppStateChange = (nextAppState) => {
+      if (nextAppState.match(/inactive|background/)) {
+        console.log('App inactive/background - Pausing all videos');
+        Object.values(mediaRefs.current).forEach(ref => ref?.pause());
+
+        // Record time spent for the last viewed item when going inactive
+        if (lastViewedRef.current.contentId) {
+          const currentTime = Date.now();
+          const lastContentId = lastViewedRef.current.contentId;
+          const duration = currentTime - lastViewedRef.current.startTime;
+          setTimeSpent((prevTimeSpent) => ({
+            ...prevTimeSpent,
+            [lastContentId]: (prevTimeSpent[lastContentId] || 0) + duration,
+          }));
+          // Reset start time as it's no longer being viewed
+          lastViewedRef.current = { startTime: null, contentId: null };
+        }
+      } else if (nextAppState === 'active') {
+        console.log('App active');
+        // Playback for the visible item will be handled by onViewableItemsChanged
+        // when the view potentially re-renders or viewability changes upon return.
+      }
+    };
+
+    const appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
+    return () => {
+      appStateSubscription?.remove();
+    };
+  }, []); // Empty dependency array: runs only on mount/unmount
+  // ---
+
+   // --- Core Logic: Handle Viewable Items Change ---
+   const onViewableItemsChanged = useCallback(({ viewableItems }) => {
     const currentTime = Date.now();
 
-    // Time spent tracking
+    // --- Time Spent Tracking ---
     if (lastViewedRef.current.contentId !== null) {
       const lastContentId = lastViewedRef.current.contentId;
       const duration = currentTime - lastViewedRef.current.startTime;
@@ -69,42 +149,124 @@ export default function Feed() {
         ...prevTimeSpent,
         [lastContentId]: (prevTimeSpent[lastContentId] || 0) + duration,
       }));
+      // Reset immediately before potentially setting a new one
+      lastViewedRef.current = { startTime: null, contentId: null };
+    }
+    // ---
 
-      lastViewedRef.current = { startTime: null, contentId: null }; // Reset before setting new one
+    // Find the primary item currently in view
+    const primaryItem = viewableItems.find(item => item.isViewable);
+
+    // If no item is sufficiently viewable, do nothing (or pause last known item)
+    if (!primaryItem) {
+      // Optional: Could try to pause the item that just became non-viewable if needed
+      return;
     }
 
-    // Added this
-    // Determine the primary item to play (usually the first fully visible one)
-    let primaryViewableItem = null;
-    if (viewableItems.length > 0) {
-       // Find the item most centered or the first one past the threshold
-      primaryViewableItem = viewableItems.find(item => item.isViewable); // Use the first viewable item
-      if (primaryViewableItem) {
-        // --- Update Time Spent Tracking ---
-         lastViewedRef.current = { startTime: currentTime, contentId: primaryViewableItem.key };
-         // --- Update Max Scroll Depth ---
-         setMaxScrollDepth((prevDepth) => Math.max(prevDepth, primaryViewableItem.index));
+    const currentItemIndex = primaryItem.index;
+    const currentItemId = primaryItem.key;
+
+    // --- Update Time Spent & Scroll Depth for the new primary item ---
+    lastViewedRef.current = { startTime: currentTime, contentId: currentItemId };
+    setMaxScrollDepth((prevDepth) => Math.max(prevDepth, currentItemIndex));
+    // ---
+
+    // Determine preload window size based on current scroll speed
+    const currentSpeed = scrollSpeed.current;
+    let preloadWindowSize;
+    if (currentSpeed < SPEED_THRESHOLD_SLOW) {
+      preloadWindowSize = PRELOAD_WINDOW_SLOW;
+    } else if (currentSpeed < SPEED_THRESHOLD_FAST) {
+      preloadWindowSize = PRELOAD_WINDOW_MEDIUM;
+    } else {
+      preloadWindowSize = PRELOAD_WINDOW_FAST;
+    }
+
+    // Calculate the range of indices to keep active (loaded/preloaded)
+    const minActiveIndex = Math.max(0, currentItemIndex - preloadWindowSize);
+    const maxActiveIndex = Math.min(array.length - 1, currentItemIndex + preloadWindowSize);
+
+    // console.log(`Speed: ${currentSpeed.toFixed(2)}, Window: ${preloadWindowSize}, ActiveRange: ${minActiveIndex}-${maxActiveIndex}, Current: ${currentItemIndex}`);
+
+    // --- Manage Video States (Play, Preload, Unload) ---
+    Object.entries(mediaRefs.current).forEach(([key, cell]) => {
+      if (!cell) return; // Skip if ref is somehow null
+
+      const itemIndex = itemIndexMap.get(key); // Get index from map
+
+      // If item associated with this ref is no longer in our data, unload it
+      if (itemIndex === undefined) {
+         cell.unload();
+         return;
       }
-    }
 
-    // Added this
-    changed.forEach((changedItem) => {
-      const cell = mediaRefs.current[changedItem.key];
-      if (cell) {
-        if (changedItem.isViewable && changedItem.key === primaryViewableItem?.key) {
-           console.log(`Playing video ${changedItem.key}`);
-           cell.play();
-        } else {
-           console.log(`Pausing video ${changedItem.key}`);
-           cell.pause();
-           // Consider unloading if it's *far* off-screen for optimization later
-           // Example: check if Math.abs(changedItem.index - primaryViewableItem.index) > 5
-           // if (!changedItem.isViewable && isFarAway) { cell.unload(); }
-        }
+      // Decide action based on index relative to the active window
+      if (key === currentItemId) {
+        // Play the primary visible item
+        cell.play();
+      } else if (itemIndex >= minActiveIndex && itemIndex <= maxActiveIndex) {
+        // Preload (load data) and ensure items in the window are paused
+        cell.preload();
+        cell.pause(); // Ensure it remains paused after preloading
       } else {
-        console.warn(`Ref not found for key: ${changedItem.key}`);
+        // Unload items far outside the active window
+        cell.unload();
       }
     });
+    // ---
+
+  }, [array, itemIndexMap]); // Depend on data array and index map
+  // ---
+
+
+
+  // const handleViewableItemsChanged = useRef(({ viewableItems, changed }) => {
+  //   const currentTime = Date.now();
+
+  //   // Time spent tracking
+  //   if (lastViewedRef.current.contentId !== null) {
+  //     const lastContentId = lastViewedRef.current.contentId;
+  //     const duration = currentTime - lastViewedRef.current.startTime;
+  //     setTimeSpent((prevTimeSpent) => ({
+  //       ...prevTimeSpent,
+  //       [lastContentId]: (prevTimeSpent[lastContentId] || 0) + duration,
+  //     }));
+
+  //     lastViewedRef.current = { startTime: null, contentId: null }; // Reset before setting new one
+  //   }
+
+  //   // Added this
+  //   // Determine the primary item to play (usually the first fully visible one)
+  //   let primaryViewableItem = null;
+  //   if (viewableItems.length > 0) {
+  //      // Find the item most centered or the first one past the threshold
+  //     primaryViewableItem = viewableItems.find(item => item.isViewable); // Use the first viewable item
+  //     if (primaryViewableItem) {
+  //       // --- Update Time Spent Tracking ---
+  //        lastViewedRef.current = { startTime: currentTime, contentId: primaryViewableItem.key };
+  //        // --- Update Max Scroll Depth ---
+  //        setMaxScrollDepth((prevDepth) => Math.max(prevDepth, primaryViewableItem.index));
+  //     }
+  //   }
+
+  //   // Added this
+  //   changed.forEach((changedItem) => {
+  //     const cell = mediaRefs.current[changedItem.key];
+  //     if (cell) {
+  //       if (changedItem.isViewable && changedItem.key === primaryViewableItem?.key) {
+  //          console.log(`Playing video ${changedItem.key}`);
+  //          cell.play();
+  //       } else {
+  //          console.log(`Pausing video ${changedItem.key}`);
+  //          cell.pause();
+  //          // Consider unloading if it's *far* off-screen for optimization later
+  //          // Example: check if Math.abs(changedItem.index - primaryViewableItem.index) > 5
+  //          // if (!changedItem.isViewable && isFarAway) { cell.unload(); }
+  //       }
+  //     } else {
+  //       console.warn(`Ref not found for key: ${changedItem.key}`);
+  //     }
+  //   });
 
 
     // if (viewableItems.length > 0) {
@@ -137,18 +299,19 @@ export default function Feed() {
     //     element.isViewable ? cell.play() : cell.pause();
     //   }
     // });
-  });
+  //});
 
   const renderItem = useCallback(({ item }) => (
-    <View style={{ height: height  }}>
+    <View style={{ height: height }} key={item.id}>
       <Post
         ref={(PostSingleRef) => {
           // Assign ref only if PostSingleRef is not null
          if (PostSingleRef) {
              mediaRefs.current[item.id.toString()] = PostSingleRef;
          } else {
-             // Optionally clean up the ref if the component unmounts
-             delete mediaRefs.current[item.id.toString()];
+            // Clean up ref if component unmounts unexpectedly
+            // delete mediaRefs.current[item.id.toString()];
+
          }
         }}
 
@@ -163,7 +326,7 @@ export default function Feed() {
       return () => {
           // Pause and unload all videos on unmount
            Object.values(mediaRefs.current).forEach(ref => {
-               ref?.pause(); // Attempt to pause
+               // ref?.pause(); // Attempt to pause
                ref?.unload(); // Attempt to unload
            });
            mediaRefs.current = {}; // Clear refs
@@ -184,15 +347,28 @@ export default function Feed() {
         decelerationRate="fast"
         showsVerticalScrollIndicator={false}
 
-        windowSize={5} // How many items to keep rendered (lower = less memory, higher = smoother scroll)
-        initialNumToRender={2} // How many items to render initially
-        maxToRenderPerBatch={2} // How many items to render per batch during scroll
-        removeClippedSubviews={true} // Can improve performance, but test carefully
+        // windowSize={5} // How many items to keep rendered (lower = less memory, higher = smoother scroll)
+        // initialNumToRender={2} // How many items to render initially
+        // maxToRenderPerBatch={2} // How many items to render per batch during scroll
+        // removeClippedSubviews={true} // Can improve performance, but test carefully
 
-        // Viewability tracking
+        // // Viewability tracking
         
-        onViewableItemsChanged={handleViewableItemsChanged.current} // Corrected line
+        // onViewableItemsChanged={handleViewableItemsChanged.current} // Corrected line
+        // viewabilityConfig={viewabilityConfig}
+
+        // Adjust windowSize based on max preload range + buffer
+        windowSize={PRELOAD_WINDOW_SLOW * 2 + 3} // e.g., slow=2 -> (2*2)+3 = 7 items kept rendered
+        initialNumToRender={3} // How many to render initially
+        maxToRenderPerBatch={2} // How many to render in background per batch
+        removeClippedSubviews={true} // Test carefully - may improve memory but can cause issues
+        // Viewability Tracking
         viewabilityConfig={viewabilityConfig}
+        onViewableItemsChanged={onViewableItemsChanged}
+        // Scroll Tracking
+        onScroll={onScroll} // Attach the scroll handler
+        scrollEventThrottle={16} // Limit scroll events (16ms = ~60fps)
+
 
         // onScroll={onScroll} // Add back if scroll speed logic is reintroduced
         // Optimization: Prevent unnecessary re-renders if item content doesn't change
